@@ -667,11 +667,75 @@ def copy_non_media_files(
     print(f"  Done copying {copied} files")
 
 
+def probe_files_batch(filepaths: list[Path]) -> dict[Path, dict[str, float | int]]:
+    """Probe multiple files in a single ffprobe call using -print_filename."""
+    if not filepaths:
+        return {}
+
+    try:
+        print(f"  Probing {len(filepaths)} files in single ffprobe call...")
+        start = time.time()
+
+        # Build command: ffprobe with -print_filename to get filename per entry
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration,size",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            "-print_filename",
+        ]
+        # Add all file paths
+        cmd.extend(str(p) for p in filepaths)
+
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        elapsed = time.time() - start
+        print(f"    ffprobe completed in {elapsed:.2f}s")
+
+        if result.returncode != 0:
+            print(f"    ffprobe failed: {result.stderr[:200]}")
+            return {}
+
+        # Parse output: format is filename on one line, then duration, then size
+        lines = result.stdout.splitlines()
+        results = {}
+        i = 0
+        while i < len(lines):
+            if i + 2 >= len(lines):
+                break
+            # The first line is filename (with possible quotes)
+            filename = lines[i].strip()
+            # Remove quotes if present
+            if filename.startswith('"') and filename.endswith('"'):
+                filename = filename[1:-1]
+            path = Path(filename)
+            duration_str = lines[i+1].strip()
+            size_str = lines[i+2].strip()
+            try:
+                duration = float(duration_str)
+                size = int(size_str)
+                results[path] = {"duration": duration, "size": size}
+            except ValueError:
+                # skip invalid entries
+                pass
+            i += 3
+
+        return results
+    except (subprocess.SubprocessError, Exception) as e:
+        print(f"    ffprobe batch error: {e}")
+        return {}
+
+
 def is_output_complete(input_path: Path, output_path: Path) -> bool:
+    # This function is kept for backwards compatibility, but the batch version is used in pre-scan.
+    # It now uses a single ffprobe call for the pair.
     if not output_path.exists() or output_path.stat().st_size == 0:
         return False
+
     try:
-        print(f"    Probing input duration with ffprobe: {input_path.name}")
+        print(f"    Probing durations with ffprobe (single call)...")
         start = time.time()
         cmd = [
             "ffprobe",
@@ -682,38 +746,24 @@ def is_output_complete(input_path: Path, output_path: Path) -> bool:
             "-of",
             "default=noprint_wrappers=1:nokey=1",
             str(input_path),
-        ]
-        r = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if r.returncode != 0:
-            return False
-        dur_in = float(r.stdout.strip())
-        elapsed = time.time() - start
-        print(f"      Input duration probe completed in {elapsed:.2f}s")
-
-        print(f"    Probing output duration with ffprobe: {output_path.name}")
-        start = time.time()
-        cmd2 = [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
             str(output_path),
         ]
-        r2 = subprocess.run(cmd2, capture_output=True, text=True, check=False)
-        if r2.returncode != 0:
-            return False
-        dur_out = float(r2.stdout.strip())
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         elapsed = time.time() - start
-        print(f"      Output duration probe completed in {elapsed:.2f}s")
+        print(f"      ffprobe completed in {elapsed:.2f}s")
 
+        if result.returncode != 0:
+            return False
+        durations = result.stdout.strip().splitlines()
+        if len(durations) < 2:
+            return False
+        dur_in = float(durations[0])
+        dur_out = float(durations[1])
         if dur_in == 0:
             return False
-        result = 0.99 <= dur_out / dur_in <= 1.01
-        print(f"    Duration match: {dur_out:.2f}s / {dur_in:.2f}s = {dur_out/dur_in:.3f} -> {'OK' if result else 'FAIL'}")
-        return result
+        ratio = dur_out / dur_in
+        print(f"    Duration match: {dur_out:.2f}s / {dur_in:.2f}s = {ratio:.3f} -> {'OK' if 0.99 <= ratio <= 1.01 else 'FAIL'}")
+        return 0.99 <= ratio <= 1.01
     except (subprocess.SubprocessError, ValueError):
         return False
 
@@ -927,7 +977,7 @@ def process_items(
     print(f"  Total media files to process: {len(conversion_map)}")
     print()
 
-    # ---- Pre‑scan for resume ----
+    # ---- Pre‑scan for resume (batched ffprobe) ----
     files_to_encode: list[Path] = []
     total_bytes: int = 0
     skipped_existing: int = 0
@@ -936,46 +986,57 @@ def process_items(
     total_items = len(conversion_map)
 
     if not force:
-        probe_tasks: list[tuple[Path, Path]] = []
+        # Build list of (input_path, output_path) pairs
+        probe_pairs: list[tuple[Path, Path]] = []
         for input_path in conversion_map.keys():
             if is_directory:
                 rel = input_path.relative_to(src_root)
                 out = dst_root / rel.with_suffix(".mkv")
             else:
                 out = input_path.parent / (input_path.stem + "-compressed.mkv")
-            probe_tasks.append((input_path, out))
+            probe_pairs.append((input_path, out))
 
-        def check_file(args: tuple[Path, Path]) -> tuple[Path, Path, bool]:
-            input_path, output_path = args
-            if fast_resume:
-                return input_path, output_path, output_path.exists()
-            return input_path, output_path, is_output_complete(input_path, output_path)
+        # Separate files that need probing (output exists)
+        all_files_to_probe: list[Path] = []
+        for inp, out in probe_pairs:
+            if out.exists() and out.stat().st_size > 0:
+                all_files_to_probe.append(inp)
+                all_files_to_probe.append(out)
 
-        print(f"  Probing {len(probe_tasks)} files with parallel workers...")
-        print("  (Progress updates every 10 files)")
-        with ThreadPoolExecutor(max_workers=min(16, len(probe_tasks))) as executor:
-            futures = {executor.submit(check_file, task): task for task in probe_tasks}
-            completed = 0
-            for future in as_completed(futures):
-                input_path, output_path, complete = future.result()
-                completed += 1
-                if complete:
-                    skipped_existing += 1
-                    total_input_bytes += input_path.stat().st_size
-                    total_output_bytes += output_path.stat().st_size
-                else:
-                    files_to_encode.append(input_path)
-                    total_bytes += input_path.stat().st_size
-                # Update progress every 10 files
-                if completed % 10 == 0:
-                    print(
-                        f"    Progress: {completed}/{len(probe_tasks)} files scanned... ({skipped_existing} found complete)"
-                    )
-            # Final update
-            if completed % 10 != 0:
-                print(
-                    f"    Progress: {completed}/{len(probe_tasks)} files scanned... ({skipped_existing} found complete)"
-                )
+        if all_files_to_probe:
+            # Probe all files in one ffprobe call
+            probe_results = probe_files_batch(all_files_to_probe)
+            if probe_results:
+                # Now check each pair
+                for inp, out in probe_pairs:
+                    if out.exists() and out.stat().st_size > 0:
+                        if inp in probe_results and out in probe_results:
+                            dur_in = probe_results[inp]["duration"]
+                            dur_out = probe_results[out]["duration"]
+                            if dur_in > 0 and 0.99 <= dur_out / dur_in <= 1.01:
+                                skipped_existing += 1
+                                total_input_bytes += inp.stat().st_size
+                                total_output_bytes += out.stat().st_size
+                                continue
+                    files_to_encode.append(inp)
+                    total_bytes += inp.stat().st_size
+            else:
+                # Fallback to individual checks if batch failed
+                print("  Batch ffprobe failed, falling back to individual checks...")
+                for inp, out in probe_pairs:
+                    if out.exists() and out.stat().st_size > 0:
+                        if is_output_complete(inp, out):
+                            skipped_existing += 1
+                            total_input_bytes += inp.stat().st_size
+                            total_output_bytes += out.stat().st_size
+                            continue
+                    files_to_encode.append(inp)
+                    total_bytes += inp.stat().st_size
+        else:
+            # No files to probe, all need encoding
+            for inp, out in probe_pairs:
+                files_to_encode.append(inp)
+                total_bytes += inp.stat().st_size
     else:
         for input_path in conversion_map.keys():
             files_to_encode.append(input_path)

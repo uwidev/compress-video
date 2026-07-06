@@ -844,6 +844,44 @@ def determine_encoding_strategy(
     return "lossless" if is_lossless(input_path) else "transparent"
 
 
+def should_skip_encoding(input_path: Path) -> bool:
+    """
+    Return True if the file appears to be low quality and not worth encoding.
+    - Bitrate < 3 Mbps
+    - Already using HEVC/AV1 with bitrate < 5 Mbps
+    - Duration < 2 seconds
+    """
+    info = analyze_source(input_path)
+    if not info:
+        print(f"    ⚠️  Could not analyze: {input_path.name} – encoding anyway")
+        return False  # Can't analyze, assume we should encode
+
+    duration = info.get('duration', 0)
+    bitrate = info.get('bit_rate', 0) / 1_000_000  # Mbps
+    codec = info.get('codec', '').lower()
+
+    # Log what we found
+    print(f"    📊 {input_path.name}: {duration:.2f}s, {bitrate:.2f} Mbps, codec={codec}")
+
+    # Very short files – overhead makes compression inefficient
+    if duration < 2.0:
+        print(f"    ⏱️  Skipping {input_path.name}: duration < 2s ({duration:.2f}s)")
+        return True
+
+    # Already modern codec and low bitrate
+    if codec in ('hevc', 'h265', 'av1') and bitrate < 5.0:
+        print(f"    📦 Skipping {input_path.name}: {codec} @ {bitrate:.2f} Mbps < 5 Mbps")
+        return True
+
+    # Very low bitrate (regardless of codec)
+    if bitrate < 3.0:
+        print(f"    📦 Skipping {input_path.name}: bitrate {bitrate:.2f} Mbps < 3 Mbps")
+        return True
+
+    print(f"    ✅ Encoding {input_path.name}: does not meet skip criteria")
+    return False
+
+
 def process_file(
     input_path: Path,
     src_root: Path | None,
@@ -856,6 +894,7 @@ def process_file(
     force: bool = False,
     fast_resume: bool = False,
     output_suffix: str = "-compressed",
+    process_all: bool = False,  # <-- new parameter
 ) -> tuple[Path, bool, str, str, Path, str, int]:
     global processed_files, processed_bytes
 
@@ -902,6 +941,35 @@ def process_file(
                     actual_strategy,
                     0,
                 )
+
+    # ---- Skip low quality (unless process_all is enabled) ----
+    if not force and not process_all and should_skip_encoding(input_path):
+        if not dry_run:
+            print(
+                f"  Skipping low-quality file: {display_name} ({file_size / 1024 / 1024:.2f} MB)"
+            )
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(input_path, output_path)
+            return (
+                input_path,
+                True,
+                "SKIPPED (low quality)",
+                gpu,
+                output_path,
+                actual_strategy,
+                file_size,
+            )
+        else:
+            print(f"  [DRY RUN] Would skip low-quality: {display_name}")
+            return (
+                input_path,
+                True,
+                "DRY RUN (skip low quality)",
+                gpu,
+                output_path,
+                actual_strategy,
+                0,
+            )
 
     # Log the start of encoding
     if not dry_run:
@@ -1066,47 +1134,16 @@ def process_items(
                 out = input_path.parent / (input_path.stem + "-compressed.mkv")
             probe_pairs.append((input_path, out))
 
-        # Separate files that need probing (output exists)
-        all_files_to_probe: list[Path] = []
+        # For each pair, check if output exists
         for inp, out in probe_pairs:
             if out.exists() and out.stat().st_size > 0:
-                all_files_to_probe.append(inp)
-                all_files_to_probe.append(out)
-
-        if all_files_to_probe:
-            # Probe all files in one ffprobe call
-            probe_results = probe_files_batch(all_files_to_probe)
-            if probe_results:
-                # Now check each pair
-                for inp, out in probe_pairs:
-                    if out.exists() and out.stat().st_size > 0:
-                        if inp in probe_results and out in probe_results:
-                            dur_in = probe_results[inp]["duration"]
-                            dur_out = probe_results[out]["duration"]
-                            if dur_in > 0 and 0.99 <= dur_out / dur_in <= 1.01:
-                                skipped_existing += 1
-                                total_input_bytes += inp.stat().st_size
-                                total_output_bytes += out.stat().st_size
-                                continue
-                    files_to_encode.append(inp)
-                    total_bytes += inp.stat().st_size
-            else:
-                # Fallback to individual checks if batch failed
-                print("  Batch ffprobe failed, falling back to individual checks...")
-                for inp, out in probe_pairs:
-                    if out.exists() and out.stat().st_size > 0:
-                        if is_output_complete(inp, out):
-                            skipped_existing += 1
-                            total_input_bytes += inp.stat().st_size
-                            total_output_bytes += out.stat().st_size
-                            continue
-                    files_to_encode.append(inp)
-                    total_bytes += inp.stat().st_size
-        else:
-            # No files to probe, all need encoding
-            for inp, out in probe_pairs:
-                files_to_encode.append(inp)
-                total_bytes += inp.stat().st_size
+                if is_output_complete(inp, out):
+                    skipped_existing += 1
+                    total_input_bytes += inp.stat().st_size
+                    total_output_bytes += out.stat().st_size
+                    continue
+            files_to_encode.append(inp)
+            total_bytes += inp.stat().st_size
     else:
         for input_path in conversion_map.keys():
             files_to_encode.append(input_path)

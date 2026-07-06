@@ -1,0 +1,1317 @@
+#!/usr/bin/env python3
+"""
+Intelligent Media Compression Script – Animation‑Optimized
+Features: Resume, Smart Audio, ETA, Dynamic Load Balancing, HEVC Encoding.
+Supports both directory and individual file processing.
+"""
+
+import argparse
+import atexit
+import json
+import queue
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any
+
+# ---- Global Defaults ----
+DEFAULT_USE_NVIDIA = True
+DEFAULT_USE_INTEL = True
+DEFAULT_NVIDIA_WORKERS = 4
+DEFAULT_INTEL_WORKERS = 6
+DEFAULT_CPU_WORKERS = 1
+DEFAULT_QUALITY = 15
+
+# ---- Global Definitions ----
+MEDIA_EXTENSIONS: set[str] = {".gif", ".mov", ".mp4", ".mkv", ".avi", ".webm", ".m4v"}
+VIDEO_PRIORITY: set[str] = {".mov", ".mp4", ".mkv", ".avi", ".webm", ".m4v"}
+
+# ETA counters
+total_bytes_to_encode: int = 0
+processed_bytes: int = 0
+processed_files: int = 0
+start_time: float = 0
+eta_lock: threading.Lock = threading.Lock()
+
+# Summary counters
+converted_count: int = 0
+failed_count: int = 0
+skipped_count: int = 0
+total_input_bytes: int = 0
+total_output_bytes: int = 0
+summary_lock: threading.Lock = threading.Lock()
+
+# Track failed files
+failed_files_list: list[tuple[Path, str]] = []
+failed_files_lock: threading.Lock = threading.Lock()
+
+
+def reset_terminal():
+    try:
+        subprocess.run(["stty", "sane"], check=False, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+atexit.register(reset_terminal)
+
+
+def signal_handler(sig: int, frame: Any) -> None:
+    print("\n\nInterrupted. Exiting...")
+    reset_terminal()
+    sys.exit(0)
+
+
+signal.signal(signal.SIGINT, signal_handler)
+
+
+def get_user_confirmation(prompt: str) -> bool:
+    reset_terminal()
+    try:
+        return input(prompt).strip().lower() in ["y", "yes"]
+    except KeyboardInterrupt:
+        reset_terminal()
+        return False
+
+
+def format_eta(seconds: float) -> str:
+    if seconds < 0:
+        return "calculating..."
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{minutes}m {secs}s"
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    return f"{hours}h {minutes}m"
+
+
+def check_gpu_availability() -> dict[str, bool]:
+    gpus: dict[str, bool] = {"intel": False, "nvidia": False}
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-encoders"], capture_output=True, text=True, check=False
+        )
+        if "hevc_nvenc" in result.stdout:
+            gpus["nvidia"] = True
+        if "hevc_qsv" in result.stdout:
+            gpus["intel"] = True
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+    try:
+        result = subprocess.run(
+            ["nvidia-smi"], capture_output=True, text=True, check=False
+        )
+        if result.returncode == 0:
+            gpus["nvidia"] = True
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+    return gpus
+
+
+def get_file_stem(filepath: Path) -> str:
+    return filepath.stem
+
+
+def get_extension(filepath: Path) -> str:
+    return filepath.suffix.lower()
+
+
+def is_lossless(filepath: Path) -> bool:
+    try:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "frame=lossless",
+            "-of",
+            "default=noprint_wrappers=1",
+            str(filepath),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if "lossless=1" in result.stdout:
+            return True
+        cmd2 = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,pix_fmt",
+            "-of",
+            "json",
+            str(filepath),
+        ]
+        result2 = subprocess.run(cmd2, capture_output=True, text=True, check=False)
+        if result2.returncode == 0:
+            data = json.loads(result2.stdout)
+            if "streams" in data and data["streams"]:
+                stream = data["streams"][0]
+                codec = stream.get("codec_name", "").lower()
+                lossless_codecs = [
+                    "ffv1",
+                    "ffvhuff",
+                    "huffyuv",
+                    "png",
+                    "qtrle",
+                    "rle",
+                    "utvideo",
+                    "v210",
+                    "v308",
+                    "v408",
+                    "v410",
+                    "yuv4",
+                ]
+                if codec in lossless_codecs:
+                    return True
+        return False
+    except (subprocess.SubprocessError, json.JSONDecodeError, KeyError):
+        return False
+
+
+def analyze_source(filepath: Path) -> dict[str, Any]:
+    try:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,pix_fmt,width,height,bit_rate",
+            "-show_entries",
+            "format=duration,size,bit_rate",
+            "-of",
+            "json",
+            str(filepath),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            return {}
+        data = json.loads(result.stdout)
+        info: dict[str, Any] = {}
+        if "streams" in data and data["streams"]:
+            stream = data["streams"][0]
+            info["codec"] = stream.get("codec_name", "unknown")
+            info["pix_fmt"] = stream.get("pix_fmt", "unknown")
+            info["width"] = int(stream.get("width", 0))
+            info["height"] = int(stream.get("height", 0))
+            info["bit_rate"] = int(stream.get("bit_rate", 0))
+        if "format" in data:
+            info["duration"] = float(data["format"].get("duration", 0))
+            info["size"] = int(data["format"].get("size", 0))
+            if info.get("bit_rate", 0) == 0:
+                info["bit_rate"] = int(data["format"].get("bit_rate", 0))
+        return info
+    except (subprocess.SubprocessError, json.JSONDecodeError, KeyError, ValueError):
+        return {}
+
+
+def is_audio_lossless(filepath: Path) -> bool:
+    try:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(filepath),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            return False
+        codec = result.stdout.strip().lower()
+        lossless_codecs = [
+            "flac",
+            "pcm_s16le",
+            "pcm_s24le",
+            "pcm_s32le",
+            "alac",
+            "wav",
+            "pcm_f32le",
+            "pcm_f64le",
+            "pcm_s16be",
+            "pcm_s24be",
+            "pcm_s32be",
+        ]
+        return codec in lossless_codecs
+    except subprocess.SubprocessError:
+        return False
+
+
+def get_gpu_name(gpu: str) -> str:
+    return {"nvidia": "NVIDIA HEVC", "intel": "INTEL HEVC", "cpu": "CPU FFV1"}.get(
+        gpu, "UNKNOWN"
+    )
+
+
+def convert_with_ffmpeg(
+    input_path: Path,
+    output_path: Path,
+    gpu: str,
+    dry_run: bool = False,
+    strategy: str = "transparent",
+    quality: int = DEFAULT_QUALITY,
+    audio_mode: str = "auto",
+) -> tuple[bool, str]:
+    if dry_run:
+        return True, "DRY_RUN"
+
+    try:
+        actual_audio, has_audio = _detect_audio(input_path, audio_mode, strategy)
+        is_lossless = strategy == "lossless"
+        target_quality = 0 if is_lossless else quality
+
+        encoders = _get_encoder_list(gpu, is_lossless)
+
+        for encoder_name, encoder_func in encoders:
+            print(f"  Trying {encoder_name}...")
+            cmd = encoder_func(
+                input_path, output_path, target_quality, has_audio, actual_audio
+            )
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, check=False, timeout=3600
+            )
+
+            if (
+                result.returncode != 0
+                or not output_path.exists()
+                or output_path.stat().st_size == 0
+            ):
+                print(f"  ⚠️  {encoder_name} failed. Trying next...")
+                continue
+
+            input_size = input_path.stat().st_size
+            output_size = output_path.stat().st_size
+
+            if output_size >= input_size:
+                print(
+                    f"  ⚠️  {encoder_name} output ({output_size / 1024 / 1024:.2f}MB) >= source ({input_size / 1024 / 1024:.2f}MB). Trying next..."
+                )
+                output_path.unlink(missing_ok=True)
+                continue
+
+            reduction = (1 - (output_size / input_size)) * 100
+            return (
+                True,
+                f"{encoder_name}: {input_size / 1024 / 1024:.2f}MB -> {output_size / 1024 / 1024:.2f}MB ({reduction:.1f}% reduction)",
+            )
+
+        print(
+            "  ⚠️  All encoders failed or produced larger files. Copying original as-is."
+        )
+        return _copy_fallback(input_path, output_path, has_audio, actual_audio)
+
+    except subprocess.TimeoutExpired:
+        return False, "TIMEOUT"
+    except Exception as e:
+        return False, f"ERROR: {str(e)[:500]}"
+
+
+def _detect_audio(
+    input_path: Path, audio_mode: str, strategy: str
+) -> tuple[str | None, bool]:
+    has_audio = False
+    try:
+        probe_cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "default=noprint_wrappers=1",
+            str(input_path),
+        ]
+        result = subprocess.run(probe_cmd, capture_output=True, text=True, check=False)
+        has_audio = "audio" in result.stdout
+    except subprocess.SubprocessError:
+        pass
+
+    if audio_mode == "auto" and has_audio:
+        if strategy == "lossless":
+            actual_audio = "copy" if is_audio_lossless(input_path) else "flac"
+        else:
+            actual_audio = "opus"
+    elif not has_audio:
+        actual_audio = None
+    else:
+        actual_audio = audio_mode
+
+    return actual_audio, has_audio
+
+
+def _get_encoder_list(gpu: str, is_lossless: bool) -> list[tuple[str, callable]]:
+    encoders = []
+    if gpu == "nvidia":
+        encoders.append(("NVIDIA NVENC", _build_nvenc_cmd))
+    if gpu in ("intel", "nvidia"):
+        encoders.append(("Intel QSV", _build_qsv_cmd))
+    if is_lossless:
+        encoders.append(("Software HEVC (lossless)", _build_software_lossless_cmd))
+    else:
+        encoders.append(("Software HEVC", _build_software_lossy_cmd))
+    return encoders
+
+
+def _build_nvenc_cmd(
+    input_path: Path,
+    output_path: Path,
+    quality: int,
+    has_audio: bool,
+    actual_audio: str | None,
+) -> list[str]:
+    cmd = [
+        "ffmpeg",
+        "-i",
+        str(input_path),
+        "-c:v",
+        "hevc_nvenc",
+        "-preset",
+        "p7",
+        "-tune",
+        "hq",
+        "-rc",
+        "vbr",
+        "-cq",
+        str(quality),
+        "-b:v",
+        "0",
+        "-pix_fmt",
+        "yuv420p",
+        "-bf",
+        "0",
+        "-g",
+        "99999",
+        "-force_key_frames",
+        "expr:eq(n,0)",
+        "-rc-lookahead",
+        "32",
+        "-spatial-aq",
+        "1",
+        "-temporal-aq",
+        "1",
+        "-loop",
+        "0",
+        "-y",
+        str(output_path),
+    ]
+    _add_audio_options(cmd, has_audio, actual_audio)
+    return cmd
+
+
+def _build_qsv_cmd(
+    input_path: Path,
+    output_path: Path,
+    quality: int,
+    has_audio: bool,
+    actual_audio: str | None,
+) -> list[str]:
+    cmd = [
+        "ffmpeg",
+        "-i",
+        str(input_path),
+        "-c:v",
+        "hevc_qsv",
+        "-preset",
+        "veryslow",
+        "-global_quality",
+        str(quality),
+        "-pix_fmt",
+        "nv12",
+        "-bf",
+        "0",
+        "-g",
+        "99999",
+        "-force_key_frames",
+        "expr:eq(n,0)",
+        "-extbrc",
+        "1",
+        "-look_ahead",
+        "1",
+        "-look_ahead_depth",
+        "32",
+        "-loop",
+        "0",
+        "-y",
+        str(output_path),
+    ]
+    _add_audio_options(cmd, has_audio, actual_audio)
+    return cmd
+
+
+def _build_software_lossy_cmd(
+    input_path: Path,
+    output_path: Path,
+    quality: int,
+    has_audio: bool,
+    actual_audio: str | None,
+) -> list[str]:
+    cmd = [
+        "ffmpeg",
+        "-i",
+        str(input_path),
+        "-vf",
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        "-c:v",
+        "libx265",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
+        "-x265-params",
+        "bframes=0:keyint=99999",
+        "-force_key_frames",
+        "expr:eq(n,0)",
+        "-loop",
+        "0",
+        "-y",
+        str(output_path),
+    ]
+    _add_audio_options(cmd, has_audio, actual_audio)
+    return cmd
+
+
+def _build_software_lossless_cmd(
+    input_path: Path,
+    output_path: Path,
+    quality: int,
+    has_audio: bool,
+    actual_audio: str | None,
+) -> list[str]:
+    print("⚠️  Lossless software HEVC produces very large files.")
+    cmd = [
+        "ffmpeg",
+        "-i",
+        str(input_path),
+        "-vf",
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        "-c:v",
+        "libx265",
+        "-crf",
+        "0",
+        "-pix_fmt",
+        "yuv444p",
+        "-x265-params",
+        "bframes=0:keyint=99999",
+        "-force_key_frames",
+        "expr:eq(n,0)",
+        "-loop",
+        "0",
+        "-y",
+        str(output_path),
+    ]
+    _add_audio_options(cmd, has_audio, actual_audio)
+    return cmd
+
+
+def _copy_fallback(
+    input_path: Path, output_path: Path, has_audio: bool, actual_audio: str | None
+) -> tuple[bool, str]:
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(input_path, output_path)
+        size = output_path.stat().st_size
+        return True, f"COPIED (original): {size / 1024 / 1024:.2f}MB"
+    except Exception as e:
+        return False, f"COPY FAILED: {str(e)[:100]}"
+
+
+def _add_audio_options(
+    cmd: list[str], has_audio: bool, actual_audio: str | None
+) -> None:
+    if not has_audio or not actual_audio:
+        return
+    if actual_audio == "copy":
+        cmd.insert(3, "-c:a")
+        cmd.insert(4, "copy")
+    elif actual_audio == "flac":
+        cmd.insert(3, "-c:a")
+        cmd.insert(4, "flac")
+    elif actual_audio == "aac":
+        cmd.insert(3, "-c:a")
+        cmd.insert(4, "aac")
+        cmd.insert(5, "-b:a")
+        cmd.insert(6, "192k")
+    elif actual_audio == "opus":
+        cmd.insert(3, "-c:a")
+        cmd.insert(4, "libopus")
+        cmd.insert(5, "-b:a")
+        cmd.insert(6, "128k")
+
+
+def find_media_files(root_dir: Path) -> tuple[dict[str, dict[str, Path]], list[Path]]:
+    media_map: dict[str, dict[str, Path]] = defaultdict(dict)
+    non_media: list[Path] = []
+    if not root_dir.exists():
+        print(f"Error: Directory {root_dir} does not exist")
+        sys.exit(1)
+    print("Scanning directory...")
+    count = 0
+    for filepath in root_dir.rglob("*"):
+        if not filepath.is_file():
+            continue
+        count += 1
+        if count % 1000 == 0:
+            print(f"  Scanned {count} files...")
+        ext = get_extension(filepath)
+        if ext in MEDIA_EXTENSIONS:
+            media_map[get_file_stem(filepath)][ext] = filepath
+        else:
+            non_media.append(filepath)
+    print(f"  Done scanning {count} files")
+    return media_map, non_media
+
+
+def resolve_media_conflicts(
+    media_map: dict[str, dict[str, Path]],
+) -> tuple[dict[Path, Path], list[Path]]:
+    conversion_map: dict[Path, Path] = {}
+    skipped_gifs: list[Path] = []
+    priority = {".mov": 0, ".mp4": 1, ".mkv": 2, ".avi": 3, ".webm": 4, ".m4v": 5}
+    for stem, ext_dict in media_map.items():
+        has_video = any(ext in VIDEO_PRIORITY for ext in ext_dict)
+        has_gif = ".gif" in ext_dict
+        if has_video and has_gif:
+            video_ext = sorted(
+                [e for e in ext_dict if e in VIDEO_PRIORITY],
+                key=lambda x: priority.get(x, 999),
+            )[0]
+            conversion_map[ext_dict[video_ext]] = ext_dict[video_ext]
+            skipped_gifs.append(ext_dict[".gif"])
+        else:
+            for path in ext_dict.values():
+                conversion_map[path] = path
+    return conversion_map, skipped_gifs
+
+
+def copy_non_media_files(
+    src_root: Path, dst_root: Path, files: list[Path], dry_run: bool = False
+) -> None:
+    if not files:
+        return
+    print("\nCopying non-media files...")
+    copied = 0
+    for filepath in files:
+        rel = filepath.relative_to(src_root)
+        dst = dst_root / rel
+        if not dry_run:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(filepath, dst)
+            copied += 1
+            if copied % 50 == 0:
+                print(f"  Copied {copied}/{len(files)}")
+    print(f"  Done copying {copied} files")
+
+
+def is_output_complete(input_path: Path, output_path: Path) -> bool:
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        return False
+    try:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(input_path),
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if r.returncode != 0:
+            return False
+        dur_in = float(r.stdout.strip())
+        cmd2 = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(output_path),
+        ]
+        r2 = subprocess.run(cmd2, capture_output=True, text=True, check=False)
+        if r2.returncode != 0:
+            return False
+        dur_out = float(r2.stdout.strip())
+        if dur_in == 0:
+            return False
+        return 0.99 <= dur_out / dur_in <= 1.01
+    except (subprocess.SubprocessError, ValueError):
+        return False
+
+
+def determine_encoding_strategy(
+    input_path: Path, force_strategy: str | None = None
+) -> str:
+    if force_strategy:
+        return force_strategy
+    return "lossless" if is_lossless(input_path) else "transparent"
+
+
+def process_file(
+    input_path: Path,
+    src_root: Path | None,
+    dst_root: Path | None,
+    gpu: str,
+    dry_run: bool,
+    quality: int,
+    strategy: str | None = None,
+    audio: str = "auto",
+    force: bool = False,
+    fast_resume: bool = False,
+    output_suffix: str = "-compressed",
+) -> tuple[Path, bool, str, str, Path, str, int]:
+    global processed_files, processed_bytes
+
+    actual_strategy = determine_encoding_strategy(input_path, strategy)
+    if src_root is not None and dst_root is not None:
+        rel = input_path.relative_to(src_root)
+        output_path = dst_root / rel.with_suffix(".mkv")
+    else:
+        # File mode: output in same dir with suffix
+        output_path = input_path.parent / (input_path.stem + output_suffix + ".mkv")
+
+    file_size = input_path.stat().st_size
+
+    # Resume check
+    if not force:
+        if fast_resume:
+            if output_path.exists():
+                if dry_run:
+                    print(f"  [RESUME] Would skip: {input_path.name} (output exists)")
+                else:
+                    print(f"  [RESUME] Skipping: {input_path.name} (output exists)")
+                return (
+                    input_path,
+                    True,
+                    "SKIPPED (output exists)",
+                    gpu,
+                    output_path,
+                    actual_strategy,
+                    0,
+                )
+        else:
+            if is_output_complete(input_path, output_path):
+                if dry_run:
+                    print(f"  [RESUME] Would skip: {input_path.name} (output complete)")
+                else:
+                    print(f"  [RESUME] Skipping: {input_path.name} (output complete)")
+                return (
+                    input_path,
+                    True,
+                    "SKIPPED (complete)",
+                    gpu,
+                    output_path,
+                    actual_strategy,
+                    0,
+                )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    success, status = convert_with_ffmpeg(
+        input_path, output_path, gpu, dry_run, actual_strategy, quality, audio
+    )
+
+    if not success and not dry_run:
+        with failed_files_lock:
+            failed_files_list.append((input_path, status))
+
+    if not dry_run and not status.startswith("SKIPPED"):
+        with eta_lock:
+            processed_files += 1
+            processed_bytes += file_size
+
+    return input_path, success, status, gpu, output_path, actual_strategy, file_size
+
+
+def format_conversion_line(
+    input_path: Path,
+    output_path: Path,
+    gpu: str,
+    strategy: str,
+    src_root: Path | None,
+    dst_root: Path | None,
+    status: str | None = None,
+) -> str:
+    if src_root is not None:
+        rel_in = str(input_path.relative_to(src_root))
+        rel_out = (
+            str(output_path.relative_to(dst_root)) if dst_root else output_path.name
+        )
+    else:
+        rel_in = input_path.name
+        rel_out = output_path.name
+    gpu_name = get_gpu_name(gpu)
+    label = strategy.upper()
+    prefix = f"[{gpu_name} {label}] CONVERT: "
+    if src_root:
+        line = f"{prefix}{src_root.name}/{rel_in}\n"
+        diff = len(prefix) + len(src_root.name) - len(dst_root.name) if dst_root else 0
+        line += (
+            f"{' ' * (diff - 2)}➥ {dst_root.name}/{rel_out}"
+            if dst_root
+            else f"{' ' * (len(prefix))}➥ {rel_out}"
+        )
+    else:
+        line = f"{prefix}{rel_in}\n"
+        line += f"{' ' * (len(prefix))}➥ {rel_out}"
+    if status:
+        line += f" - {status}"
+    return line
+
+
+def build_file_list(args: list[str]) -> tuple[list[Path], bool]:
+    """
+    Parse arguments: if exactly one arg and it's a directory, return directory mode.
+    Otherwise, treat all args as files.
+    Returns (files_or_root, is_directory_mode).
+    """
+    paths = [Path(a).resolve() for a in args]
+    # If only one argument and it's a directory, treat as directory mode.
+    if len(paths) == 1 and paths[0].is_dir():
+        return paths, True
+    # Otherwise, treat as file list (filter out directories? we'll error if directory is mixed)
+    for p in paths:
+        if p.is_dir():
+            print(
+                f"Error: When specifying multiple inputs, directories are not allowed (found: {p})"
+            )
+            sys.exit(1)
+    return paths, False
+
+
+def process_items(
+    items: list[Path] | Path,
+    dst_root: Path | None,
+    dry_run: bool,
+    use_intel: bool,
+    use_nvidia: bool,
+    nvidia_workers: int,
+    intel_workers: int,
+    cpu_workers: int,
+    quality: int,
+    strategy: str | None,
+    audio: str,
+    force: bool,
+    fast_resume: bool,
+    is_directory: bool,
+) -> dict:
+    """
+    Unified processing for both directory and file lists.
+    """
+    global total_bytes_to_encode, processed_bytes, processed_files, start_time
+    global converted_count, failed_count, skipped_count
+    global total_input_bytes, total_output_bytes
+
+    gpus = check_gpu_availability()
+    available: list[str] = []
+    if use_nvidia and gpus["nvidia"]:
+        available.append("nvidia")
+    if use_intel and gpus["intel"]:
+        available.append("intel")
+    if not available:
+        available.append("cpu")
+
+    print(f"\n✅ Selected encoders: {', '.join(get_gpu_name(g) for g in available)}")
+    print("\n⚙️ Settings:")
+    print(f"  Strategy: {'auto-detect' if strategy is None else strategy}")
+    print(f"  Quality: {quality} (1=best, 15=transparent, 30=smaller)")
+    print(f"  Audio: {audio}")
+    print(f"  Force re-encode: {'YES' if force else 'NO'}")
+    print(
+        f"  Workers: NVIDIA={nvidia_workers}, Intel={intel_workers}, CPU={cpu_workers}"
+    )
+    print()
+
+    if is_directory:
+        # Directory mode: scan and build conversion_map
+        media_map, non_media = find_media_files(items[0])
+        conversion_map, skipped_gifs = resolve_media_conflicts(media_map)
+        src_root = items[0]
+        dst_root = dst_root or Path(f"{src_root}-compressed")
+    else:
+        # File mode: each file is a media file; no conflict resolution
+        conversion_map = {p: p for p in items}
+        skipped_gifs = []
+        non_media = []
+        src_root = None
+        dst_root = None  # will be set per file in process_file
+
+    # ---- Pre‑scan for resume ----
+    files_to_encode: list[Path] = []
+    total_bytes: int = 0
+    skipped_existing: int = 0
+
+    print("\nPre-scanning for resume...")
+    total_items = len(conversion_map)
+
+    if not force:
+        probe_tasks: list[tuple[Path, Path]] = []
+        for input_path in conversion_map.keys():
+            if is_directory:
+                rel = input_path.relative_to(src_root)
+                out = dst_root / rel.with_suffix(".mkv")
+            else:
+                out = input_path.parent / (input_path.stem + "-compressed.mkv")
+            probe_tasks.append((input_path, out))
+
+        def check_file(args: tuple[Path, Path]) -> tuple[Path, Path, bool]:
+            input_path, output_path = args
+            if fast_resume:
+                return input_path, output_path, output_path.exists()
+            return input_path, output_path, is_output_complete(input_path, output_path)
+
+        print(f"  Probing {len(probe_tasks)} files with parallel workers...")
+        with ThreadPoolExecutor(max_workers=min(16, len(probe_tasks))) as executor:
+            futures = {executor.submit(check_file, task): task for task in probe_tasks}
+            completed = 0
+            for future in as_completed(futures):
+                input_path, output_path, complete = future.result()
+                completed += 1
+                if complete:
+                    skipped_existing += 1
+                    total_input_bytes += input_path.stat().st_size
+                    total_output_bytes += output_path.stat().st_size
+                else:
+                    files_to_encode.append(input_path)
+                    total_bytes += input_path.stat().st_size
+                if completed % 500 == 0:
+                    print(
+                        f"  Scanned {completed}/{len(probe_tasks)} files... ({skipped_existing} found complete)"
+                    )
+    else:
+        for input_path in conversion_map.keys():
+            files_to_encode.append(input_path)
+            total_bytes += input_path.stat().st_size
+
+    print("\n  Pre-scan complete:")
+    print(
+        f"  • {len(files_to_encode)} files need encoding ({total_bytes / 1024 / 1024 / 1024:.2f} GB)"
+    )
+    print(f"  • {skipped_existing} files already complete (will be skipped)")
+    if skipped_existing > 0:
+        estimated_minutes = (skipped_existing * 30) / 60
+        print(
+            f"  • Resume will save ~{estimated_minutes:.1f} minutes of encoding time (estimated)"
+        )
+    total_bytes_to_encode = total_bytes
+    print()
+
+    if dry_run:
+        print("--- DRY RUN: Sample files to convert (first 20) ---\n")
+        for i, inp in enumerate(files_to_encode[:20]):
+            if is_directory:
+                out = dst_root / inp.relative_to(src_root).with_suffix(".mkv")
+            else:
+                out = inp.parent / (inp.stem + "-compressed.mkv")
+            strat = determine_encoding_strategy(inp, strategy)
+            gpu_display = available[0] if available else "cpu"
+            print(
+                format_conversion_line(
+                    inp,
+                    out,
+                    gpu_display,
+                    strat,
+                    src_root,
+                    dst_root if is_directory else None,
+                )
+            )
+            print()
+        if len(files_to_encode) > 20:
+            print(f"  ... and {len(files_to_encode) - 20} more files\n")
+        if skipped_gifs:
+            print("Skipped GIFs (video version will be used instead):")
+            for gif in skipped_gifs[:10]:
+                print(
+                    f"  SKIP: {gif.relative_to(src_root) if is_directory else gif.name}"
+                )
+            if len(skipped_gifs) > 10:
+                print(f"  ... and {len(skipped_gifs) - 10} more")
+        return {
+            "converted": 0,
+            "failed": 0,
+            "skipped": skipped_existing,
+            "non_media": len(non_media) if is_directory else 0,
+            "skipped_gifs": len(skipped_gifs),
+        }
+
+    # ---- Shared queue ----
+    file_queue: queue.Queue = queue.Queue()
+    for f in files_to_encode:
+        file_queue.put(f)
+
+    total_files = len(files_to_encode)
+    processed_files = 0
+    processed_bytes = 0
+    start_time = time.time()
+    converted_count = 0
+    failed_count = 0
+    skipped_count = 0
+
+    def worker_loop(gpu: str) -> None:
+        nonlocal total_files
+        while True:
+            try:
+                inp = file_queue.get(timeout=0.5)
+            except queue.Empty:
+                break
+            try:
+                result = process_file(
+                    inp,
+                    src_root,
+                    dst_root if is_directory else None,
+                    gpu,
+                    dry_run,
+                    quality,
+                    strategy,
+                    audio,
+                    force,
+                    fast_resume,
+                )
+                with summary_lock:
+                    global converted_count, failed_count, skipped_count
+                    global total_input_bytes, total_output_bytes
+                    inp, success, status, gpu_used, out, strat, fsize = result
+
+                    if status.startswith("SKIPPED"):
+                        skipped_count += 1
+                    elif success:
+                        converted_count += 1
+                        total_input_bytes += inp.stat().st_size
+                        total_output_bytes += out.stat().st_size
+                        if status and not status.startswith("DONE"):
+                            rel = (
+                                inp.relative_to(src_root) if is_directory else inp.name
+                            )
+                            print(f"  [{get_gpu_name(gpu_used)}] ✓ {rel} -> {status}")
+                    else:
+                        failed_count += 1
+                        rel = inp.relative_to(src_root) if is_directory else inp.name
+                        print(
+                            f"  [{get_gpu_name(gpu_used)}] ✗ FAILED: {rel} - {status}"
+                        )
+            except Exception as e:
+                print(f"  Worker for {gpu} crashed on {inp}: {e}")
+            finally:
+                file_queue.task_done()
+
+    # ---- Start threads ----
+    threads: list[threading.Thread] = []
+    if "nvidia" in available:
+        for _ in range(nvidia_workers):
+            t = threading.Thread(target=worker_loop, args=("nvidia",))
+            t.start()
+            threads.append(t)
+    if "intel" in available:
+        for _ in range(intel_workers):
+            t = threading.Thread(target=worker_loop, args=("intel",))
+            t.start()
+            threads.append(t)
+    if "cpu" in available:
+        for _ in range(cpu_workers):
+            t = threading.Thread(target=worker_loop, args=("cpu",))
+            t.start()
+            threads.append(t)
+
+    file_queue.join()
+    for t in threads:
+        t.join()
+
+    print(f"\n  Completed all {total_files} files")
+
+    # ---- Copy non‑media files (only in directory mode) ----
+    if is_directory and non_media:
+        copy_non_media_files(src_root, dst_root, non_media, dry_run)
+
+    # ---- Summary ----
+    print("\n" + "=" * 50)
+    print("SUMMARY")
+    print("=" * 50)
+    print(f"Converted: {converted_count}")
+    print(f"Failed: {failed_count}")
+    print(f"Skipped (already complete): {skipped_count}")
+    if is_directory:
+        print(f"Skipped GIFs (video exists): {len(skipped_gifs)}")
+        print(f"Non-media copied: {len(non_media)}")
+    else:
+        print(f"Files processed: {len(conversion_map)}")
+
+    if failed_files_list:
+        print("\n" + "=" * 50)
+        print("FAILED FILES")
+        print("=" * 50)
+        print(f"Total failures: {len(failed_files_list)}")
+        print()
+        for i, (filepath, error) in enumerate(failed_files_list[:20]):
+            rel = filepath.relative_to(src_root) if is_directory else filepath.name
+            error_short = error[:200] + "..." if len(error) > 200 else error
+            print(f"  {i + 1}. {rel}")
+            print(f"     Error: {error_short}")
+            print()
+        if len(failed_files_list) > 20:
+            print(f"  ... and {len(failed_files_list) - 20} more failures")
+            if is_directory:
+                print(f"  Full list saved to: {dst_root}/failed_files.txt")
+        if not dry_run and is_directory:
+            fail_log = dst_root / "failed_files.txt"
+            with open(fail_log, "w") as f:
+                f.write(f"Failed files ({len(failed_files_list)} total)\n")
+                f.write("=" * 60 + "\n\n")
+                for filepath, error in failed_files_list:
+                    rel = (
+                        filepath.relative_to(src_root)
+                        if is_directory
+                        else filepath.name
+                    )
+                    f.write(f"File: {rel}\n")
+                    f.write(f"Error: {error}\n")
+                    f.write("-" * 40 + "\n")
+            print(f"  Full failure log: {fail_log}")
+
+    if total_input_bytes > 0 and total_output_bytes > 0:
+        reduction = (1 - (total_output_bytes / total_input_bytes)) * 100
+        print("\n" + "=" * 50)
+        print("COMPRESSION STATISTICS")
+        print("=" * 50)
+        print(f"Total input size:  {total_input_bytes / 1024 / 1024 / 1024:.2f} GB")
+        print(f"Total output size: {total_output_bytes / 1024 / 1024 / 1024:.2f} GB")
+        print(
+            f"Space saved:       {total_input_bytes / 1024 / 1024 / 1024 - total_output_bytes / 1024 / 1024 / 1024:.2f} GB ({reduction:.1f}% reduction)"
+        )
+        if converted_count > 0:
+            print(f"Files encoded:     {converted_count} files")
+        if skipped_count > 0:
+            print(f"Files skipped:     {skipped_count} files (already complete)")
+
+    print("\n⚠️  Notes:")
+    print("  • Animation-optimized HEVC encoding (quality 15)")
+    print("  • Loop-optimized: -bf 0 -g 99999 -force_key_frames expr:eq(n,0)")
+    print("  • Dynamic load balancing: faster GPUs process more files")
+
+    return {
+        "converted": converted_count,
+        "failed": failed_count,
+        "skipped": skipped_count,
+        "non_media": len(non_media) if is_directory else 0,
+        "skipped_gifs": len(skipped_gifs),
+        "failed_files": failed_files_list,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Animation‑optimized media compression with HEVC",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s Wa17                              # Process all media in directory
+  %(prog)s file1.mov file2.gif               # Process specific files
+  %(prog)s Wa17 --no-nvidia                  # Intel only
+  %(prog)s Wa17 --no-intel                   # NVIDIA only
+  %(prog)s --no-intel --no-nvidia file.mov   # CPU only
+  %(prog)s Wa17 --fast-resume                # Skip duration check
+  %(prog)s Wa17 -y                           # Skip confirmation
+        """,
+    )
+    parser.add_argument(
+        "-y", "--yes", action="store_true", help="Skip confirmation prompt"
+    )
+    parser.add_argument(
+        "--fast-resume",
+        action="store_true",
+        help="Skip duration verification; skip if output file exists (faster resume)",
+    )
+    parser.add_argument(
+        "inputs",
+        nargs="+",
+        help="One or more files or directories (if one directory, process all media inside)",
+    )
+    parser.add_argument(
+        "-o", "--output-dir", help="Output directory (only for directory mode)"
+    )
+
+    # Worker counts
+    parser.add_argument(
+        "--nvidia-workers",
+        type=int,
+        default=DEFAULT_NVIDIA_WORKERS,
+        help=f"Number of parallel NVIDIA encoding threads (default: {DEFAULT_NVIDIA_WORKERS})",
+    )
+    parser.add_argument(
+        "--intel-workers",
+        type=int,
+        default=DEFAULT_INTEL_WORKERS,
+        help=f"Number of parallel Intel encoding threads (default: {DEFAULT_INTEL_WORKERS})",
+    )
+    parser.add_argument(
+        "--cpu-workers",
+        type=int,
+        default=DEFAULT_CPU_WORKERS,
+        help=f"Number of parallel CPU encoding threads (default: {DEFAULT_CPU_WORKERS})",
+    )
+
+    # Strategy
+    parser.add_argument(
+        "--strategy",
+        choices=["auto", "lossless", "transparent"],
+        default="auto",
+        help="Encoding strategy (default: auto)",
+    )
+
+    # Audio
+    parser.add_argument(
+        "--audio",
+        choices=["copy", "flac", "aac", "opus"],
+        default="auto",
+        help="Audio handling (default: auto – copy if lossless, opus if lossy)",
+    )
+
+    # Quality
+    parser.add_argument(
+        "--quality",
+        type=int,
+        default=DEFAULT_QUALITY,
+        choices=range(1, 52),
+        help=f"Quality level 1-51 (default: {DEFAULT_QUALITY}, lower=better quality)",
+    )
+
+    # Force
+    parser.add_argument(
+        "--force", action="store_true", help="Force re-encode even if output exists"
+    )
+
+    # Device enable/disable flags
+    parser.add_argument(
+        "--nvidia",
+        dest="use_nvidia",
+        action="store_true",
+        default=DEFAULT_USE_NVIDIA,
+        help="Enable NVIDIA GPU (default)",
+    )
+    parser.add_argument(
+        "--no-nvidia",
+        dest="use_nvidia",
+        action="store_false",
+        help="Disable NVIDIA GPU",
+    )
+    parser.add_argument(
+        "--intel",
+        dest="use_intel",
+        action="store_true",
+        default=DEFAULT_USE_INTEL,
+        help="Enable Intel GPU (default)",
+    )
+    parser.add_argument(
+        "--no-intel",
+        dest="use_intel",
+        action="store_false",
+        help="Disable Intel GPU",
+    )
+
+    # Dry run
+    parser.add_argument("--dry-run", action="store_true", help="Preview only")
+
+    args = parser.parse_args()
+
+    # Check mutual exclusivity of enable/disable flags
+    argv = sys.argv
+    if ("--nvidia" in argv and "--no-nvidia" in argv) or (
+        "--intel" in argv and "--no-intel" in argv
+    ):
+        parser.error(
+            "Cannot specify both --nvidia and --no-nvidia (or --intel and --no-intel)"
+        )
+
+    # Parse inputs
+    items, is_directory = build_file_list(args.inputs)
+
+    if is_directory:
+        if args.output_dir:
+            dst_root = Path(args.output_dir).resolve()
+        else:
+            dst_root = Path(f"{items[0]}-compressed")
+    else:
+        if args.output_dir:
+            print("Warning: --output-dir is ignored when processing individual files")
+        dst_root = None
+
+    if not args.dry_run:
+        print("WARNING: This will convert media files:")
+        if is_directory:
+            print(f"  Source directory: {items[0]}")
+            print(f"  Output directory: {dst_root}")
+        else:
+            print("  Input files:")
+            for f in items:
+                print(f"    {f}")
+            print(
+                "  Output: Each file will be saved with '-compressed' suffix in the same directory"
+            )
+        print(f"\n📊 Strategy: {args.strategy}")
+        print(f"📊 Quality: {args.quality} (1=best, 15=transparent, 30=smaller)")
+        print(f"🎵 Audio: {args.audio}")
+        if args.force:
+            print("⚠️ Force re-encode: ON")
+        print(
+            f"🔄 Workers: NVIDIA={args.nvidia_workers}, Intel={args.intel_workers}, CPU={args.cpu_workers}"
+        )
+        gpus = check_gpu_availability()
+        enabled = []
+        if args.use_nvidia and gpus["nvidia"]:
+            enabled.append("NVIDIA")
+        if args.use_intel and gpus["intel"]:
+            enabled.append("Intel")
+        if not enabled:
+            enabled.append("CPU (fallback)")
+        print(f"\n✅ Selected encoders: {', '.join(enabled)}")
+        print("✅ Content: Animation (optimized)")
+        if not args.yes:
+            if not get_user_confirmation("\nContinue? (y/N): "):
+                print("Aborted.")
+                sys.exit(0)
+            print()
+
+    start = time.time()
+    force_strat = None if args.strategy == "auto" else args.strategy
+    results = process_items(
+        items=items,
+        dst_root=dst_root,
+        dry_run=args.dry_run,
+        use_intel=args.use_intel,
+        use_nvidia=args.use_nvidia,
+        nvidia_workers=args.nvidia_workers,
+        intel_workers=args.intel_workers,
+        cpu_workers=args.cpu_workers,
+        quality=args.quality,
+        strategy=force_strat,
+        audio=args.audio,
+        force=args.force,
+        fast_resume=args.fast_resume,
+        is_directory=is_directory,
+    )
+    elapsed = time.time() - start
+    print(f"\nTotal time: {elapsed:.2f}s ({elapsed / 60:.1f} minutes)")
+
+
+if __name__ == "__main__":
+    main()

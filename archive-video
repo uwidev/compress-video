@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Intelligent Media Compression Script – Animation‑Optimized
+Intelligent Media Compression Script – Animation-Optimized
 Features: Resume, Smart Audio, ETA, Dynamic Load Balancing, HEVC Encoding.
 Supports both directory and individual file processing.
 """
@@ -52,6 +52,17 @@ failed_files_list: list[tuple[Path, str]] = []
 failed_files_lock: threading.Lock = threading.Lock()
 
 
+def log_subprocess(cmd: list[str], description: str) -> tuple[int, str, str]:
+    """Run a subprocess with logging."""
+    print(f"    Running: {description}")
+    print(f"      Command: {' '.join(cmd[:4])}... (truncated)")
+    start = time.time()
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    elapsed = time.time() - start
+    print(f"      Completed in {elapsed:.2f}s (exit code: {result.returncode})")
+    return result.returncode, result.stdout, result.stderr
+
+
 def reset_terminal():
     try:
         subprocess.run(["stty", "sane"], check=False, stderr=subprocess.DEVNULL)
@@ -97,23 +108,30 @@ def format_eta(seconds: float) -> str:
 def check_gpu_availability() -> dict[str, bool]:
     gpus: dict[str, bool] = {"intel": False, "nvidia": False}
     try:
+        print("  Checking GPU availability with ffmpeg -encoders...")
         result = subprocess.run(
             ["ffmpeg", "-encoders"], capture_output=True, text=True, check=False
         )
         if "hevc_nvenc" in result.stdout:
             gpus["nvidia"] = True
+            print("    NVIDIA NVENC (HEVC) available")
         if "hevc_qsv" in result.stdout:
             gpus["intel"] = True
+            print("    Intel QSV (HEVC) available")
     except (subprocess.SubprocessError, FileNotFoundError):
         pass
-    try:
-        result = subprocess.run(
-            ["nvidia-smi"], capture_output=True, text=True, check=False
-        )
-        if result.returncode == 0:
-            gpus["nvidia"] = True
-    except (subprocess.SubprocessError, FileNotFoundError):
-        pass
+
+    if not gpus["nvidia"]:
+        try:
+            print("    Checking NVIDIA with nvidia-smi...")
+            result = subprocess.run(
+                ["nvidia-smi"], capture_output=True, text=True, check=False
+            )
+            if result.returncode == 0:
+                gpus["nvidia"] = True
+                print("    NVIDIA GPU detected via nvidia-smi")
+        except (subprocess.SubprocessError, FileNotFoundError):
+            pass
     return gpus
 
 
@@ -126,7 +144,10 @@ def get_extension(filepath: Path) -> str:
 
 
 def is_lossless(filepath: Path) -> bool:
+    """Check if a video file is lossless."""
     try:
+        # First check: look for lossless flag
+        print(f"    Checking lossless status with ffprobe: {filepath.name}")
         cmd = [
             "ffprobe",
             "-v",
@@ -141,7 +162,11 @@ def is_lossless(filepath: Path) -> bool:
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if "lossless=1" in result.stdout:
+            print(f"    -> File is lossless (flag detected)")
             return True
+
+        # Fallback: check codec/pix_fmt (this is faster)
+        print(f"    Checking codec/pix_fmt with ffprobe: {filepath.name}")
         cmd2 = [
             "ffprobe",
             "-v",
@@ -175,14 +200,18 @@ def is_lossless(filepath: Path) -> bool:
                     "yuv4",
                 ]
                 if codec in lossless_codecs:
+                    print(f"    -> File is lossless (codec {codec})")
                     return True
+        print(f"    -> File is lossy")
         return False
     except (subprocess.SubprocessError, json.JSONDecodeError, KeyError):
+        print(f"    -> Error checking lossless status")
         return False
 
 
 def analyze_source(filepath: Path) -> dict[str, Any]:
     try:
+        print(f"    Analyzing source with ffprobe: {filepath.name}")
         cmd = [
             "ffprobe",
             "-v",
@@ -214,13 +243,16 @@ def analyze_source(filepath: Path) -> dict[str, Any]:
             info["size"] = int(data["format"].get("size", 0))
             if info.get("bit_rate", 0) == 0:
                 info["bit_rate"] = int(data["format"].get("bit_rate", 0))
+        print(f"    Analysis complete: {info.get('codec', 'unknown')} @ {info.get('width', 0)}x{info.get('height', 0)}")
         return info
     except (subprocess.SubprocessError, json.JSONDecodeError, KeyError, ValueError):
+        print(f"    Error analyzing source")
         return {}
 
 
 def is_audio_lossless(filepath: Path) -> bool:
     try:
+        print(f"    Checking audio lossless with ffprobe: {filepath.name}")
         cmd = [
             "ffprobe",
             "-v",
@@ -250,8 +282,11 @@ def is_audio_lossless(filepath: Path) -> bool:
             "pcm_s24be",
             "pcm_s32be",
         ]
-        return codec in lossless_codecs
+        result_bool = codec in lossless_codecs
+        print(f"    Audio is {'lossless' if result_bool else 'lossy'} ({codec})")
+        return result_bool
     except subprocess.SubprocessError:
+        print(f"    Error checking audio lossless")
         return False
 
 
@@ -285,9 +320,14 @@ def convert_with_ffmpeg(
             cmd = encoder_func(
                 input_path, output_path, target_quality, has_audio, actual_audio
             )
+            print(f"    Running ffmpeg (this may take a while for large files)...")
+            print(f"      Command: {' '.join(cmd[:6])}... (truncated)")
+            start = time.time()
             result = subprocess.run(
                 cmd, capture_output=True, text=True, check=False, timeout=3600
             )
+            elapsed = time.time() - start
+            print(f"      ffmpeg completed in {elapsed:.2f}s (exit code: {result.returncode})")
 
             if (
                 result.returncode != 0
@@ -295,6 +335,8 @@ def convert_with_ffmpeg(
                 or output_path.stat().st_size == 0
             ):
                 print(f"  ⚠️  {encoder_name} failed. Trying next...")
+                if result.stderr:
+                    print(f"      Error: {result.stderr[:200]}...")
                 continue
 
             input_size = input_path.stat().st_size
@@ -319,7 +361,7 @@ def convert_with_ffmpeg(
         return _copy_fallback(input_path, output_path, has_audio, actual_audio)
 
     except subprocess.TimeoutExpired:
-        return False, "TIMEOUT"
+        return False, "TIMEOUT (1 hour)"
     except Exception as e:
         return False, f"ERROR: {str(e)[:500]}"
 
@@ -329,6 +371,7 @@ def _detect_audio(
 ) -> tuple[str | None, bool]:
     has_audio = False
     try:
+        print(f"    Checking audio presence with ffprobe: {input_path.name}")
         probe_cmd = [
             "ffprobe",
             "-v",
@@ -343,6 +386,7 @@ def _detect_audio(
         ]
         result = subprocess.run(probe_cmd, capture_output=True, text=True, check=False)
         has_audio = "audio" in result.stdout
+        print(f"    Audio {'present' if has_audio else 'not present'}")
     except subprocess.SubprocessError:
         pass
 
@@ -527,6 +571,7 @@ def _copy_fallback(
     input_path: Path, output_path: Path, has_audio: bool, actual_audio: str | None
 ) -> tuple[bool, str]:
     try:
+        print(f"    Copying original file to: {output_path}")
         output_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(input_path, output_path)
         size = output_path.stat().st_size
@@ -626,6 +671,8 @@ def is_output_complete(input_path: Path, output_path: Path) -> bool:
     if not output_path.exists() or output_path.stat().st_size == 0:
         return False
     try:
+        print(f"    Probing input duration with ffprobe: {input_path.name}")
+        start = time.time()
         cmd = [
             "ffprobe",
             "-v",
@@ -640,6 +687,11 @@ def is_output_complete(input_path: Path, output_path: Path) -> bool:
         if r.returncode != 0:
             return False
         dur_in = float(r.stdout.strip())
+        elapsed = time.time() - start
+        print(f"      Input duration probe completed in {elapsed:.2f}s")
+
+        print(f"    Probing output duration with ffprobe: {output_path.name}")
+        start = time.time()
         cmd2 = [
             "ffprobe",
             "-v",
@@ -654,9 +706,14 @@ def is_output_complete(input_path: Path, output_path: Path) -> bool:
         if r2.returncode != 0:
             return False
         dur_out = float(r2.stdout.strip())
+        elapsed = time.time() - start
+        print(f"      Output duration probe completed in {elapsed:.2f}s")
+
         if dur_in == 0:
             return False
-        return 0.99 <= dur_out / dur_in <= 1.01
+        result = 0.99 <= dur_out / dur_in <= 1.01
+        print(f"    Duration match: {dur_out:.2f}s / {dur_in:.2f}s = {dur_out/dur_in:.3f} -> {'OK' if result else 'FAIL'}")
+        return result
     except (subprocess.SubprocessError, ValueError):
         return False
 
@@ -685,11 +742,12 @@ def process_file(
     global processed_files, processed_bytes
 
     actual_strategy = determine_encoding_strategy(input_path, strategy)
-    if src_root is not None and dst_root is not None:
+    if src_root is not None:
         rel = input_path.relative_to(src_root)
         output_path = dst_root / rel.with_suffix(".mkv")
+        display_name = str(rel)
     else:
-        # File mode: output in same dir with suffix
+        display_name = input_path.name
         output_path = input_path.parent / (input_path.stem + output_suffix + ".mkv")
 
     file_size = input_path.stat().st_size
@@ -699,9 +757,9 @@ def process_file(
         if fast_resume:
             if output_path.exists():
                 if dry_run:
-                    print(f"  [RESUME] Would skip: {input_path.name} (output exists)")
+                    print(f"  [RESUME] Would skip: {display_name} (output exists)")
                 else:
-                    print(f"  [RESUME] Skipping: {input_path.name} (output exists)")
+                    print(f"  [RESUME] Skipping: {display_name} (output exists)")
                 return (
                     input_path,
                     True,
@@ -714,9 +772,9 @@ def process_file(
         else:
             if is_output_complete(input_path, output_path):
                 if dry_run:
-                    print(f"  [RESUME] Would skip: {input_path.name} (output complete)")
+                    print(f"  [RESUME] Would skip: {display_name} (output complete)")
                 else:
-                    print(f"  [RESUME] Skipping: {input_path.name} (output complete)")
+                    print(f"  [RESUME] Skipping: {display_name} (output complete)")
                 return (
                     input_path,
                     True,
@@ -726,6 +784,10 @@ def process_file(
                     actual_strategy,
                     0,
                 )
+
+    # Log the start of encoding
+    if not dry_run:
+        print(f"  Processing: {display_name} ({file_size / 1024 / 1024:.2f} MB) - {actual_strategy}")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     success, status = convert_with_ffmpeg(
@@ -816,13 +878,12 @@ def process_items(
     fast_resume: bool,
     is_directory: bool,
 ) -> dict:
-    """
-    Unified processing for both directory and file lists.
-    """
+    """Unified processing for both directory and file lists."""
     global total_bytes_to_encode, processed_bytes, processed_files, start_time
     global converted_count, failed_count, skipped_count
     global total_input_bytes, total_output_bytes
 
+    print("\nDetecting available hardware...")
     gpus = check_gpu_availability()
     available: list[str] = []
     if use_nvidia and gpus["nvidia"]:
@@ -845,24 +906,33 @@ def process_items(
 
     if is_directory:
         # Directory mode: scan and build conversion_map
+        print("Scanning for media files...")
         media_map, non_media = find_media_files(items[0])
+        print(f"  Found {len(media_map)} unique media files (by stem).")
+        print("Resolving conflicts between GIF and video files...")
         conversion_map, skipped_gifs = resolve_media_conflicts(media_map)
+        if skipped_gifs:
+            print(f"  Skipped {len(skipped_gifs)} GIF files (video version exists).")
         src_root = items[0]
         dst_root = dst_root or Path(f"{src_root}-compressed")
     else:
         # File mode: each file is a media file; no conflict resolution
+        print("Processing individual files...")
         conversion_map = {p: p for p in items}
         skipped_gifs = []
         non_media = []
         src_root = None
         dst_root = None  # will be set per file in process_file
 
+    print(f"  Total media files to process: {len(conversion_map)}")
+    print()
+
     # ---- Pre‑scan for resume ----
     files_to_encode: list[Path] = []
     total_bytes: int = 0
     skipped_existing: int = 0
 
-    print("\nPre-scanning for resume...")
+    print("Checking for existing output files (resume)...")
     total_items = len(conversion_map)
 
     if not force:
@@ -882,6 +952,7 @@ def process_items(
             return input_path, output_path, is_output_complete(input_path, output_path)
 
         print(f"  Probing {len(probe_tasks)} files with parallel workers...")
+        print("  (Progress updates every 10 files)")
         with ThreadPoolExecutor(max_workers=min(16, len(probe_tasks))) as executor:
             futures = {executor.submit(check_file, task): task for task in probe_tasks}
             completed = 0
@@ -895,14 +966,21 @@ def process_items(
                 else:
                     files_to_encode.append(input_path)
                     total_bytes += input_path.stat().st_size
-                if completed % 500 == 0:
+                # Update progress every 10 files
+                if completed % 10 == 0:
                     print(
-                        f"  Scanned {completed}/{len(probe_tasks)} files... ({skipped_existing} found complete)"
+                        f"    Progress: {completed}/{len(probe_tasks)} files scanned... ({skipped_existing} found complete)"
                     )
+            # Final update
+            if completed % 10 != 0:
+                print(
+                    f"    Progress: {completed}/{len(probe_tasks)} files scanned... ({skipped_existing} found complete)"
+                )
     else:
         for input_path in conversion_map.keys():
             files_to_encode.append(input_path)
             total_bytes += input_path.stat().st_size
+        print(f"  Force mode: all {len(files_to_encode)} files will be re-encoded")
 
     print("\n  Pre-scan complete:")
     print(
@@ -956,6 +1034,7 @@ def process_items(
         }
 
     # ---- Shared queue ----
+    print(f"Starting encoding of {len(files_to_encode)} files using {len(available)} encoder(s)...")
     file_queue: queue.Queue = queue.Queue()
     for f in files_to_encode:
         file_queue.put(f)

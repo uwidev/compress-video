@@ -1,4 +1,4 @@
-# archive-videos
+# archive-video
 
 A media compression script optimized for animated content, using hardware-accelerated HEVC encoding with smart fallback and dynamic load balancing.
 
